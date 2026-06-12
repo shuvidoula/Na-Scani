@@ -116,7 +116,13 @@
     if (!window.cv) return Promise.resolve(false);
     if (window.cv.Mat) return Promise.resolve(true);
     if (typeof window.cv.then === "function") {
-      return window.cv.then(function () { return true; }).catch(function () { return false; });
+      return new Promise(function (resolve) {
+        try {
+          window.cv.then(function () { resolve(true); });
+        } catch (e) {
+          resolve(false);
+        }
+      });
     }
     return new Promise(function (resolve) {
       var attempts = 0;
@@ -286,8 +292,111 @@
     return points;
   }
 
+  function findPaperByLightMask(sourceCanvas) {
+    if (!window.cv || !window.cv.Mat) return null;
+    var src = null;
+    var rgba = null;
+    var mask = null;
+    var kernel = null;
+    var contours = null;
+    var hierarchy = null;
+    var best = null;
+    var bestScore = 0;
+    try {
+      src = cv.imread(sourceCanvas);
+      var data = src.data;
+      mask = new cv.Mat(sourceCanvas.height, sourceCanvas.width, cv.CV_8UC1);
+      var maskData = mask.data;
+      var width = sourceCanvas.width;
+      var height = sourceCanvas.height;
+      var borderValues = [];
+      var step = Math.max(8, Math.round(Math.min(width, height) / 120));
+      var border = Math.round(Math.min(width, height) * .08);
+      for (var sy = 0; sy < height; sy += step) {
+        for (var sx = 0; sx < width; sx += step) {
+          if (sx > border && sx < width - border && sy > border && sy < height - border) continue;
+          var si = (sy * width + sx) * 4;
+          borderValues.push(data[si] * .299 + data[si + 1] * .587 + data[si + 2] * .114);
+        }
+      }
+      var bg = median(borderValues);
+      var threshold = clamp(bg + 18, 112, 188);
+      for (var y = 0; y < height; y += 1) {
+        for (var x = 0; x < width; x += 1) {
+          var i = (y * width + x) * 4;
+          var r = data[i];
+          var g = data[i + 1];
+          var b = data[i + 2];
+          var luma = r * .299 + g * .587 + b * .114;
+          var spread = Math.max(r, g, b) - Math.min(r, g, b);
+          var neutral = spread < 78 || (luma > 172 && spread < 110);
+          var paper = neutral && luma > threshold;
+          maskData[y * width + x] = paper ? 255 : 0;
+        }
+      }
+      kernel = cv.Mat.ones(9, 9, cv.CV_8U);
+      cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel);
+      cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
+      cv.dilate(mask, mask, kernel, new cv.Point(-1, -1), 2);
+      contours = new cv.MatVector();
+      hierarchy = new cv.Mat();
+      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      for (var c = 0; c < contours.size(); c += 1) {
+        var contour = contours.get(c);
+        var area = cv.contourArea(contour);
+        if (area < width * height * .035) {
+          contour.delete();
+          continue;
+        }
+        var rect = cv.boundingRect(contour);
+        var touchesTooMuch = rect.x <= 1 && rect.y <= 1 && rect.width >= width - 2 && rect.height >= height - 2;
+        if (touchesTooMuch) {
+          contour.delete();
+          continue;
+        }
+        var peri = cv.arcLength(contour, true);
+        var localBest = null;
+        [.018, .026, .04, .065, .09].some(function (epsilon) {
+          var approx = new cv.Mat();
+          cv.approxPolyDP(contour, approx, peri * epsilon, true);
+          if (approx.rows === 4) {
+            localBest = orderCorners(readApproxPoints(approx));
+            approx.delete();
+            return true;
+          }
+          approx.delete();
+          return false;
+        });
+        if (!localBest) {
+          var minRect = cv.minAreaRect(contour);
+          localBest = orderCorners(cv.RotatedRect.points(minRect).map(function (point) {
+            return { x: point.x, y: point.y };
+          }));
+        }
+        var score = cornerScore(localBest, width, height) * 1.28;
+        if (score > bestScore) {
+          bestScore = score;
+          best = localBest;
+        }
+        contour.delete();
+      }
+    } catch (e) {
+      best = null;
+    } finally {
+      if (src) src.delete();
+      if (rgba) rgba.delete();
+      if (mask) mask.delete();
+      if (kernel) kernel.delete();
+      if (contours) contours.delete();
+      if (hierarchy) hierarchy.delete();
+    }
+    return bestScore > sourceCanvas.width * sourceCanvas.height * .02 ? best : null;
+  }
+
   function findDocumentCorners(sourceCanvas) {
     if (!window.cv || !window.cv.Mat) return null;
+    var lightMaskCorners = findPaperByLightMask(sourceCanvas);
+    if (lightMaskCorners) return lightMaskCorners;
     var src = null;
     var gray = null;
     var blur = null;
@@ -388,6 +497,93 @@
     } catch (e) {
       return null;
     }
+  }
+
+  function trimWarpedPaper(canvas) {
+    var ctx = canvas.getContext("2d", { willReadFrequently: true });
+    var image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    var data = image.data;
+    var width = canvas.width;
+    var height = canvas.height;
+    function isPaperPixel(x, y) {
+      var i = (y * width + x) * 4;
+      var r = data[i];
+      var g = data[i + 1];
+      var b = data[i + 2];
+      var luma = r * .299 + g * .587 + b * .114;
+      var spread = Math.max(r, g, b) - Math.min(r, g, b);
+      return luma > 132 && (spread < 88 || luma > 178);
+    }
+    function isDarkPixel(x, y) {
+      var i = (y * width + x) * 4;
+      var r = data[i];
+      var g = data[i + 1];
+      var b = data[i + 2];
+      var luma = r * .299 + g * .587 + b * .114;
+      return luma < 78;
+    }
+    function rowPaperRatio(y) {
+      var hits = 0;
+      var dark = 0;
+      var total = 0;
+      var step = Math.max(2, Math.round(width / 360));
+      for (var x = 0; x < width; x += step) {
+        total += 1;
+        if (isPaperPixel(x, y)) hits += 1;
+        if (isDarkPixel(x, y)) dark += 1;
+      }
+      return total ? { paper: hits / total, dark: dark / total } : { paper: 0, dark: 1 };
+    }
+    function columnPaperRatio(x) {
+      var hits = 0;
+      var dark = 0;
+      var total = 0;
+      var step = Math.max(2, Math.round(height / 480));
+      for (var y = 0; y < height; y += step) {
+        total += 1;
+        if (isPaperPixel(x, y)) hits += 1;
+        if (isDarkPixel(x, y)) dark += 1;
+      }
+      return total ? { paper: hits / total, dark: dark / total } : { paper: 0, dark: 1 };
+    }
+    var top = 0;
+    var bottom = height - 1;
+    var left = 0;
+    var right = width - 1;
+    while (top < height * .28) {
+      var topRatio = rowPaperRatio(top);
+      if (topRatio.paper >= .76 && topRatio.dark <= .018) break;
+      top += 1;
+    }
+    while (bottom > height * .72) {
+      var bottomRatio = rowPaperRatio(bottom);
+      if (bottomRatio.paper >= .76 && bottomRatio.dark <= .018) break;
+      bottom -= 1;
+    }
+    while (left < width * .22) {
+      var leftRatio = columnPaperRatio(left);
+      if (leftRatio.paper >= .74 && leftRatio.dark <= .018) break;
+      left += 1;
+    }
+    while (right > width * .78) {
+      var rightRatio = columnPaperRatio(right);
+      if (rightRatio.paper >= .74 && rightRatio.dark <= .018) break;
+      right -= 1;
+    }
+    top = clamp(top + 2, 0, height - 1);
+    bottom = clamp(bottom - 2, 0, height - 1);
+    left = clamp(left + 2, 0, width - 1);
+    right = clamp(right - 2, 0, width - 1);
+    var trimW = right - left + 1;
+    var trimH = bottom - top + 1;
+    if (trimW < width * .65 || trimH < height * .65) return;
+    if (left < 3 && top < 3 && right > width - 4 && bottom > height - 4) return;
+    var copy = document.createElement("canvas");
+    copy.width = trimW;
+    copy.height = trimH;
+    copy.getContext("2d").drawImage(canvas, left, top, trimW, trimH, 0, 0, trimW, trimH);
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(copy, 0, 0, width, height);
   }
 
   function detectDocumentBox(canvas) {
@@ -519,6 +715,7 @@
       crop.width = scannerCanvas.width;
       crop.height = scannerCanvas.height;
       ctx.drawImage(scannerCanvas, 0, 0);
+      trimWarpedPaper(crop);
     } else {
       var box = detectDocumentBox(sourceCanvas);
       crop.width = box.width;
@@ -926,6 +1123,16 @@
     showCapture();
   }
 
+  async function runTestPhotoIfNeeded() {
+    var params = new URLSearchParams(window.location.search);
+    if (!params.has("testPhoto")) return;
+    var img = await dataUrlToImage("фото%20на%20тест/IMG_0094.jpeg");
+    state.pages = [];
+    state.selected = 0;
+    await addScanFromSource(img);
+    showReview();
+  }
+
   function bindEvents() {
     $("#scanBtn").addEventListener("click", function () {
       var video = $("#camera");
@@ -1002,6 +1209,9 @@
       state.scannerStatus = ready ? "ready" : "fallback";
       updateStatus();
       if (ready) toast("OpenCV сканер готовий.");
+      runTestPhotoIfNeeded().catch(function () {
+        toast("Тестове фото не обробилось.");
+      });
     });
     await openDb();
     await loadDocument();

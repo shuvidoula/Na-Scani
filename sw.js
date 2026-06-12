@@ -1,4 +1,4 @@
-const CACHE_NAME = "na-scani-v0.2.4";
+const CACHE_NAME = "na-scani-v0.2.9";
 const FILES = [
   "./",
   "./index.html",
