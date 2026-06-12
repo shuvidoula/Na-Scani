@@ -1,0 +1,15 @@
+{
+  "name": "na-scani",
+  "version": "0.1.0",
+  "description": "НА-СКАНІ: локальний мобільний PWA-сканер документів без акаунтів і серверів.",
+  "private": true,
+  "main": "src/js/app.js",
+  "scripts": {
+    "check": "node --check src/js/app.js && node --check sw.js",
+    "serve": "python3 -m http.server 4173"
+  },
+  "keywords": [],
+  "author": "ShuviDoula",
+  "license": "UNLICENSED",
+  "type": "commonjs"
+}

@@ -1,0 +1,648 @@
+(function () {
+  "use strict";
+
+  var DB_NAME = "na-scani-db";
+  var STORE_NAME = "documents";
+  var DOC_ID = "active-document";
+  var MAX_SCAN_WIDTH = 1600;
+  var state = {
+    db: null,
+    stream: null,
+    pages: [],
+    selected: 0,
+    mode: "bw",
+    detecting: false,
+    lastBox: null,
+    cropMode: false,
+    cropRect: null,
+    cropStart: null
+  };
+
+  function $(selector) {
+    return document.querySelector(selector);
+  }
+
+  function toast(text) {
+    var el = $("#appToast");
+    el.textContent = text;
+    el.classList.add("show");
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(function () {
+      el.classList.remove("show");
+      el.textContent = "";
+    }, 1800);
+  }
+
+  function uid() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  function openDb() {
+    return new Promise(function (resolve, reject) {
+      var request = indexedDB.open(DB_NAME, 1);
+      request.onupgradeneeded = function () {
+        request.result.createObjectStore(STORE_NAME, { keyPath: "id" });
+      };
+      request.onsuccess = function () {
+        state.db = request.result;
+        resolve();
+      };
+      request.onerror = function () {
+        reject(request.error);
+      };
+    });
+  }
+
+  function saveDocument() {
+    if (!state.db) return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      var tx = state.db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).put({
+        id: DOC_ID,
+        pages: state.pages,
+        selected: state.selected,
+        updatedAt: new Date().toISOString()
+      });
+      tx.oncomplete = resolve;
+      tx.onerror = function () { reject(tx.error); };
+    });
+  }
+
+  function loadDocument() {
+    if (!state.db) return Promise.resolve();
+    return new Promise(function (resolve) {
+      var tx = state.db.transaction(STORE_NAME, "readonly");
+      var request = tx.objectStore(STORE_NAME).get(DOC_ID);
+      request.onsuccess = function () {
+        if (request.result) {
+          state.pages = request.result.pages || [];
+          state.selected = Math.min(request.result.selected || 0, Math.max(0, state.pages.length - 1));
+        }
+        resolve();
+      };
+      request.onerror = resolve;
+    });
+  }
+
+  function dataUrlToImage(dataUrl) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = reject;
+      img.src = dataUrl;
+    });
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(reader.result); };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function canvasToBlob(canvas, type, quality) {
+    return new Promise(function (resolve) {
+      canvas.toBlob(resolve, type, quality);
+    });
+  }
+
+  function fitSize(width, height, maxWidth) {
+    if (width <= maxWidth) return { width: width, height: height };
+    var ratio = maxWidth / width;
+    return { width: Math.round(width * ratio), height: Math.round(height * ratio) };
+  }
+
+  function captureToCanvas(source) {
+    var sourceWidth = source.videoWidth || source.naturalWidth || source.width;
+    var sourceHeight = source.videoHeight || source.naturalHeight || source.height;
+    var size = fitSize(sourceWidth, sourceHeight, MAX_SCAN_WIDTH);
+    var canvas = $("#workCanvas");
+    var ctx = canvas.getContext("2d", { willReadFrequently: true });
+    canvas.width = size.width;
+    canvas.height = size.height;
+    ctx.drawImage(source, 0, 0, size.width, size.height);
+    return canvas;
+  }
+
+  function detectDocumentBox(canvas) {
+    var ctx = canvas.getContext("2d", { willReadFrequently: true });
+    var step = Math.max(4, Math.round(Math.min(canvas.width, canvas.height) / 180));
+    var data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    var minX = canvas.width;
+    var minY = canvas.height;
+    var maxX = 0;
+    var maxY = 0;
+    var count = 0;
+    for (var y = 0; y < canvas.height; y += step) {
+      for (var x = 0; x < canvas.width; x += step) {
+        var i = (y * canvas.width + x) * 4;
+        var r = data[i];
+        var g = data[i + 1];
+        var b = data[i + 2];
+        var brightness = (r + g + b) / 3;
+        var spread = Math.max(r, g, b) - Math.min(r, g, b);
+        if (brightness > 118 && spread < 82) {
+          minX = Math.min(minX, x);
+          minY = Math.min(minY, y);
+          maxX = Math.max(maxX, x);
+          maxY = Math.max(maxY, y);
+          count += 1;
+        }
+      }
+    }
+    var area = (maxX - minX) * (maxY - minY);
+    if (count < 50 || area < canvas.width * canvas.height * .12) {
+      return { x: 0, y: 0, width: canvas.width, height: canvas.height, detected: false };
+    }
+    var pad = Math.round(Math.min(canvas.width, canvas.height) * .018);
+    minX = Math.max(0, minX - pad);
+    minY = Math.max(0, minY - pad);
+    maxX = Math.min(canvas.width, maxX + pad);
+    maxY = Math.min(canvas.height, maxY + pad);
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY, detected: true };
+  }
+
+  function applyScanLook(canvas, mode) {
+    var ctx = canvas.getContext("2d", { willReadFrequently: true });
+    var image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    var data = image.data;
+    for (var i = 0; i < data.length; i += 4) {
+      var gray = data[i] * .299 + data[i + 1] * .587 + data[i + 2] * .114;
+      if (mode === "bw") {
+        var value = gray > 154 ? 255 : 0;
+        data[i] = value;
+        data[i + 1] = value;
+        data[i + 2] = value;
+      } else if (mode === "gray") {
+        var lifted = Math.max(0, Math.min(255, (gray - 22) * 1.24));
+        data[i] = lifted;
+        data[i + 1] = lifted;
+        data[i + 2] = lifted;
+      } else {
+        data[i] = Math.max(0, Math.min(255, (data[i] - 10) * 1.12));
+        data[i + 1] = Math.max(0, Math.min(255, (data[i + 1] - 10) * 1.12));
+        data[i + 2] = Math.max(0, Math.min(255, (data[i + 2] - 10) * 1.12));
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+  }
+
+  async function processCanvas(sourceCanvas) {
+    var box = detectDocumentBox(sourceCanvas);
+    var crop = $("#cropCanvas");
+    var ctx = crop.getContext("2d", { willReadFrequently: true });
+    crop.width = box.width;
+    crop.height = box.height;
+    ctx.drawImage(sourceCanvas, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
+    applyScanLook(crop, state.mode);
+    var blob = await canvasToBlob(crop, "image/jpeg", .88);
+    return {
+      id: uid(),
+      dataUrl: await blobToDataUrl(blob),
+      rotation: 0,
+      detected: box.detected
+    };
+  }
+
+  async function addScanFromSource(source) {
+    var page = await processCanvas(captureToCanvas(source));
+    state.pages.push(page);
+    state.selected = state.pages.length - 1;
+    await saveDocument();
+    render();
+    toast(page.detected ? "Сторінку обрізано автоматично." : "Сторінку додано.");
+  }
+
+  async function startCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      $("#cameraFallback").hidden = false;
+      return;
+    }
+    try {
+      state.stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      });
+      $("#camera").srcObject = state.stream;
+      $("#cameraFallback").hidden = true;
+      requestAnimationFrame(drawGuide);
+    } catch (e) {
+      $("#cameraFallback").hidden = false;
+      toast("Камеру не відкрито. Додайте фото.");
+    }
+  }
+
+  function drawGuide() {
+    var video = $("#camera");
+    var canvas = $("#guideCanvas");
+    var panel = canvas.parentElement;
+    canvas.width = panel.clientWidth;
+    canvas.height = panel.clientHeight;
+    var ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "rgba(0, 0, 0, .18)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    var box = {
+      x: canvas.width * .08,
+      y: canvas.height * .08,
+      width: canvas.width * .84,
+      height: canvas.height * .84
+    };
+    if (video.videoWidth && !state.detecting) {
+      state.detecting = true;
+      setTimeout(function () {
+        try {
+          var temp = document.createElement("canvas");
+          temp.width = 360;
+          temp.height = Math.max(240, Math.round(360 * video.videoHeight / video.videoWidth));
+          temp.getContext("2d").drawImage(video, 0, 0, temp.width, temp.height);
+          state.lastBox = detectDocumentBox(temp);
+        } catch (e) {
+          state.lastBox = null;
+        }
+        state.detecting = false;
+      }, 260);
+    }
+    if (state.lastBox && state.lastBox.detected) {
+      box = {
+        x: state.lastBox.x / 360 * canvas.width,
+        y: state.lastBox.y / Math.max(240, Math.round(360 * video.videoHeight / video.videoWidth)) * canvas.height,
+        width: state.lastBox.width / 360 * canvas.width,
+        height: state.lastBox.height / Math.max(240, Math.round(360 * video.videoHeight / video.videoWidth)) * canvas.height
+      };
+    }
+    ctx.clearRect(box.x, box.y, box.width, box.height);
+    ctx.strokeStyle = state.lastBox && state.lastBox.detected ? "#dfe9b9" : "rgba(255, 254, 249, .85)";
+    ctx.lineWidth = 3;
+    ctx.setLineDash([16, 10]);
+    ctx.strokeRect(box.x, box.y, box.width, box.height);
+    ctx.setLineDash([]);
+    if (!$("#capturePage").hidden) requestAnimationFrame(drawGuide);
+  }
+
+  function showCapture() {
+    $("#capturePage").hidden = false;
+    $("#reviewPage").hidden = true;
+    requestAnimationFrame(drawGuide);
+  }
+
+  function showReview() {
+    $("#capturePage").hidden = true;
+    $("#reviewPage").hidden = false;
+    render();
+  }
+
+  function updateStatus() {
+    var count = state.pages.length;
+    $("#docStatus").textContent = count ? count + " стор. у документі" : "Локальний сканер";
+  }
+
+  function render() {
+    updateStatus();
+    var hasPages = state.pages.length > 0;
+    $("#emptyState").hidden = hasPages;
+    $("#pagePreview").hidden = !hasPages;
+    $("#previewImage").src = hasPages ? state.pages[state.selected].dataUrl : "";
+    $("#cropLayer").hidden = !state.cropMode || !hasPages;
+    $("#cropBtn").textContent = state.cropMode ? "Готово" : "Обрізати";
+    if (state.cropMode && hasPages) requestAnimationFrame(drawCropBox);
+    var list = $("#thumbList");
+    list.innerHTML = "";
+    state.pages.forEach(function (page, index) {
+      var button = document.createElement("button");
+      button.className = "thumb" + (index === state.selected ? " active" : "");
+      button.type = "button";
+      button.setAttribute("aria-label", "Сторінка " + (index + 1));
+      button.dataset.index = String(index);
+      var img = document.createElement("img");
+      img.alt = "";
+      img.src = page.dataUrl;
+      button.appendChild(img);
+      list.appendChild(button);
+    });
+    ["rotateBtn", "cropBtn", "deleteBtn", "shareBtn"].forEach(function (id) {
+      $("#" + id).disabled = !hasPages;
+    });
+  }
+
+  async function rotateSelected() {
+    if (!state.pages.length) return;
+    var page = state.pages[state.selected];
+    var img = await dataUrlToImage(page.dataUrl);
+    var canvas = $("#workCanvas");
+    var ctx = canvas.getContext("2d");
+    canvas.width = img.height;
+    canvas.height = img.width;
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(Math.PI / 2);
+    ctx.drawImage(img, -img.width / 2, -img.height / 2);
+    page.dataUrl = await blobToDataUrl(await canvasToBlob(canvas, "image/jpeg", .88));
+    await saveDocument();
+    render();
+  }
+
+  async function recropSelected() {
+    if (!state.pages.length) return;
+    if (!state.cropMode) {
+      enterCropMode();
+      return;
+    }
+    if (state.cropRect) {
+      await applyManualCrop();
+      return;
+    }
+    var page = state.pages[state.selected];
+    var img = await dataUrlToImage(page.dataUrl);
+    state.pages[state.selected] = await processCanvas(captureToCanvas(img));
+    state.pages[state.selected].id = page.id;
+    state.cropMode = false;
+    await saveDocument();
+    render();
+    toast("Обрізання оновлено.");
+  }
+
+  function enterCropMode() {
+    state.cropMode = true;
+    state.cropRect = null;
+    state.cropStart = null;
+    render();
+    toast("Проведіть рамку по сторінці.");
+  }
+
+  function previewImageRect() {
+    return $("#previewImage").getBoundingClientRect();
+  }
+
+  function normalizeRect(rect) {
+    var x = Math.min(rect.x, rect.x2);
+    var y = Math.min(rect.y, rect.y2);
+    return {
+      x: x,
+      y: y,
+      width: Math.abs(rect.x2 - rect.x),
+      height: Math.abs(rect.y2 - rect.y)
+    };
+  }
+
+  function pointInImage(event) {
+    var image = previewImageRect();
+    return {
+      x: Math.max(0, Math.min(image.width, event.clientX - image.left)),
+      y: Math.max(0, Math.min(image.height, event.clientY - image.top))
+    };
+  }
+
+  function drawCropBox() {
+    var box = $("#cropBox");
+    var layer = $("#cropLayer");
+    var image = previewImageRect();
+    var layerRect = layer.getBoundingClientRect();
+    var rect = state.cropRect || {
+      x: image.width * .08,
+      y: image.height * .08,
+      width: image.width * .84,
+      height: image.height * .84
+    };
+    box.style.left = (image.left - layerRect.left + rect.x) + "px";
+    box.style.top = (image.top - layerRect.top + rect.y) + "px";
+    box.style.width = rect.width + "px";
+    box.style.height = rect.height + "px";
+  }
+
+  async function applyManualCrop() {
+    var page = state.pages[state.selected];
+    var img = await dataUrlToImage(page.dataUrl);
+    var image = previewImageRect();
+    var rect = state.cropRect;
+    if (!rect || rect.width < 24 || rect.height < 24) {
+      state.cropMode = false;
+      state.cropRect = null;
+      render();
+      return;
+    }
+    var sx = Math.round(rect.x / image.width * img.width);
+    var sy = Math.round(rect.y / image.height * img.height);
+    var sw = Math.round(rect.width / image.width * img.width);
+    var sh = Math.round(rect.height / image.height * img.height);
+    var canvas = $("#workCanvas");
+    var ctx = canvas.getContext("2d", { willReadFrequently: true });
+    canvas.width = sw;
+    canvas.height = sh;
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+    page.dataUrl = await blobToDataUrl(await canvasToBlob(canvas, "image/jpeg", .88));
+    state.cropMode = false;
+    state.cropRect = null;
+    await saveDocument();
+    render();
+    toast("Обрізано.");
+  }
+
+  async function deleteSelected() {
+    if (!state.pages.length) return;
+    state.cropMode = false;
+    state.cropRect = null;
+    state.pages.splice(state.selected, 1);
+    state.selected = Math.min(state.selected, Math.max(0, state.pages.length - 1));
+    await saveDocument();
+    render();
+  }
+
+  function escapePdfText(text) {
+    return text.replace(/[()\\]/g, "\\$&");
+  }
+
+  function bytesFromString(text) {
+    var bytes = new Uint8Array(text.length);
+    for (var i = 0; i < text.length; i += 1) bytes[i] = text.charCodeAt(i) & 255;
+    return bytes;
+  }
+
+  function dataUrlToBytes(dataUrl) {
+    var binary = atob(dataUrl.split(",")[1]);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  async function makePdfBlob() {
+    var chunks = [];
+    var offsets = [0];
+    var position = 0;
+    var objects = [];
+    function add(textOrBytes) {
+      var bytes = typeof textOrBytes === "string" ? bytesFromString(textOrBytes) : textOrBytes;
+      chunks.push(bytes);
+      position += bytes.length;
+    }
+    function object(id, bodyParts) {
+      offsets[id] = position;
+      add(id + " 0 obj\n");
+      bodyParts.forEach(add);
+      add("\nendobj\n");
+    }
+    add("%PDF-1.4\n");
+    var pageIds = [];
+    state.pages.forEach(function (page, index) {
+      var imgId = 3 + index * 3;
+      var contentId = imgId + 1;
+      var pageId = imgId + 2;
+      var bytes = dataUrlToBytes(page.dataUrl);
+      var img = new Image();
+      objects.push({ page: page, imgId: imgId, contentId: contentId, pageId: pageId, bytes: bytes, image: img });
+      pageIds.push(pageId + " 0 R");
+    });
+    for (var i = 0; i < objects.length; i += 1) {
+      objects[i].image = await dataUrlToImage(objects[i].page.dataUrl);
+    }
+    object(1, ["<< /Type /Catalog /Pages 2 0 R >>"]);
+    object(2, ["<< /Type /Pages /Kids [", pageIds.join(" "), "] /Count ", String(pageIds.length), " >>"]);
+    objects.forEach(function (item) {
+      var w = item.image.width;
+      var h = item.image.height;
+      var pageW = 595;
+      var pageH = Math.round(pageW * h / w);
+      var content = "q\n" + pageW + " 0 0 " + pageH + " 0 0 cm\n/Im0 Do\nQ\n";
+      object(item.imgId, [
+        "<< /Type /XObject /Subtype /Image /Width ", String(w),
+        " /Height ", String(h),
+        " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ", String(item.bytes.length),
+        " >>\nstream\n", item.bytes, "\nendstream"
+      ]);
+      object(item.contentId, [
+        "<< /Length ", String(content.length), " >>\nstream\n", content, "endstream"
+      ]);
+      object(item.pageId, [
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ", String(pageW), " ", String(pageH),
+        "] /Resources << /XObject << /Im0 ", String(item.imgId), " 0 R >> >> /Contents ",
+        String(item.contentId), " 0 R >>"
+      ]);
+    });
+    var xref = position;
+    add("xref\n0 " + (objects.length * 3 + 3) + "\n0000000000 65535 f \n");
+    for (var id = 1; id <= objects.length * 3 + 2; id += 1) {
+      add(String(offsets[id]).padStart(10, "0") + " 00000 n \n");
+    }
+    add("trailer\n<< /Size " + (objects.length * 3 + 3) + " /Root 1 0 R /Info << /Title (" + escapePdfText("НА-СКАНІ") + ") >> >>\nstartxref\n" + xref + "\n%%EOF");
+    return new Blob(chunks, { type: "application/pdf" });
+  }
+
+  async function shareDocument() {
+    if (!state.pages.length) return;
+    var blob = await makePdfBlob();
+    var file = new File([blob], "na-scani.pdf", { type: "application/pdf" });
+    if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
+      await navigator.share({
+        files: [file],
+        title: "НА-СКАНІ",
+        text: "Скан документа"
+      });
+      return;
+    }
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = "na-scani.pdf";
+    link.click();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+    toast("PDF збережено.");
+  }
+
+  async function newDocument() {
+    if (state.pages.length && !confirm("Очистити поточний документ?")) return;
+    state.pages = [];
+    state.selected = 0;
+    await saveDocument();
+    render();
+    showCapture();
+  }
+
+  function bindEvents() {
+    $("#scanBtn").addEventListener("click", function () {
+      var video = $("#camera");
+      if (!video.videoWidth) {
+        toast("Камера ще не готова.");
+        return;
+      }
+      addScanFromSource(video).then(showReview).catch(function () {
+        toast("Не вдалося зробити скан.");
+      });
+    });
+    $("#pickBtn").addEventListener("click", function () {
+      $("#fileInput").click();
+    });
+    $("#fileInput").addEventListener("change", async function (event) {
+      var file = event.target.files && event.target.files[0];
+      event.target.value = "";
+      if (!file) return;
+      var img = await dataUrlToImage(await blobToDataUrl(file));
+      await addScanFromSource(img);
+      showReview();
+    });
+    $("#finishBtn").addEventListener("click", showReview);
+    $("#backToCameraBtn").addEventListener("click", showCapture);
+    $("#rotateBtn").addEventListener("click", rotateSelected);
+    $("#cropBtn").addEventListener("click", recropSelected);
+    $("#deleteBtn").addEventListener("click", deleteSelected);
+    $("#shareBtn").addEventListener("click", function () {
+      shareDocument().catch(function () { toast("Поділитись не вдалося."); });
+    });
+    $("#newDocBtn").addEventListener("click", newDocument);
+    $("#thumbList").addEventListener("click", function (event) {
+      var button = event.target.closest(".thumb");
+      if (!button) return;
+      state.cropMode = false;
+      state.cropRect = null;
+      state.selected = Number(button.dataset.index);
+      saveDocument();
+      render();
+    });
+    $("#cropLayer").addEventListener("pointerdown", function (event) {
+      if (!state.cropMode) return;
+      var point = pointInImage(event);
+      state.cropStart = point;
+      state.cropRect = { x: point.x, y: point.y, width: 1, height: 1 };
+      $("#cropLayer").setPointerCapture(event.pointerId);
+      drawCropBox();
+    });
+    $("#cropLayer").addEventListener("pointermove", function (event) {
+      if (!state.cropMode || !state.cropStart) return;
+      var point = pointInImage(event);
+      state.cropRect = normalizeRect({ x: state.cropStart.x, y: state.cropStart.y, x2: point.x, y2: point.y });
+      drawCropBox();
+    });
+    $("#cropLayer").addEventListener("pointerup", function () {
+      state.cropStart = null;
+      drawCropBox();
+    });
+    document.querySelectorAll(".mode-btn").forEach(function (button) {
+      button.addEventListener("click", function () {
+        document.querySelectorAll(".mode-btn").forEach(function (item) { item.classList.remove("active"); });
+        button.classList.add("active");
+        state.mode = button.dataset.mode;
+      });
+    });
+  }
+
+  async function init() {
+    bindEvents();
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("sw.js").catch(function () {});
+    }
+    await openDb();
+    await loadDocument();
+    render();
+    await startCamera();
+    if (state.pages.length) showReview();
+  }
+
+  init().catch(function () {
+    toast("Застосунок запустився без локального сховища.");
+    startCamera();
+  });
+}());
