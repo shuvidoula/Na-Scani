@@ -7,7 +7,7 @@
   <meta name="apple-mobile-web-app-title" content="НА-СКАНІ">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#4f5b35">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; manifest-src 'self'; worker-src 'self'; connect-src 'none'; navigate-to 'self' blob:; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; manifest-src 'self'; worker-src 'self'; connect-src 'none'; navigate-to 'self' blob:; base-uri 'none'; form-action 'none';">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="stylesheet" href="src/css/app.css">
@@ -85,6 +85,9 @@
     <div id="appToast" class="app-toast" role="status" aria-live="polite"></div>
   </div>
 
-  <script src="src/js/app.js"></script>
+  <script src="src/js/boot-errors.js?v=0.2.3"></script>
+  <script src="vendor/jscanify/opencv.js?v=1.4.2"></script>
+  <script src="vendor/jscanify/jscanify.js?v=1.4.2"></script>
+  <script src="src/js/app.js?v=0.2.4"></script>
 </body>
 </html>

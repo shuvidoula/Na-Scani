@@ -11,8 +11,12 @@
     pages: [],
     selected: 0,
     mode: "bw",
+    scannerStatus: "loading",
     detecting: false,
     lastBox: null,
+    lastShape: null,
+    scanner: null,
+    scannerReady: false,
     cropMode: false,
     cropRect: null,
     cropStart: null
@@ -108,10 +112,91 @@
     });
   }
 
+  function waitForOpenCv() {
+    if (!window.cv) return Promise.resolve(false);
+    if (window.cv.Mat) return Promise.resolve(true);
+    if (typeof window.cv.then === "function") {
+      return window.cv.then(function () { return true; }).catch(function () { return false; });
+    }
+    return new Promise(function (resolve) {
+      var attempts = 0;
+      var timer = setInterval(function () {
+        attempts += 1;
+        if (window.cv && window.cv.Mat) {
+          clearInterval(timer);
+          resolve(true);
+        } else if (attempts > 80) {
+          clearInterval(timer);
+          resolve(false);
+        }
+      }, 50);
+    });
+  }
+
+  async function prepareScanner() {
+    if (state.scannerReady) return true;
+    var ready = await waitForOpenCv();
+    if (!ready || !window.jscanify) return false;
+    state.scanner = state.scanner || new window.jscanify();
+    state.scannerReady = true;
+    return true;
+  }
+
   function fitSize(width, height, maxWidth) {
     if (width <= maxWidth) return { width: width, height: height };
     var ratio = maxWidth / width;
     return { width: Math.round(width * ratio), height: Math.round(height * ratio) };
+  }
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function median(values) {
+    if (!values.length) return 0;
+    values.sort(function (a, b) { return a - b; });
+    return values[Math.floor(values.length / 2)];
+  }
+
+  function a4CenterBox(width, height) {
+    var portraitRatio = 1 / 1.414;
+    var boxHeight = height * .88;
+    var boxWidth = boxHeight * portraitRatio;
+    if (boxWidth > width * .88) {
+      boxWidth = width * .88;
+      boxHeight = boxWidth / portraitRatio;
+    }
+    return {
+      x: Math.round((width - boxWidth) / 2),
+      y: Math.round((height - boxHeight) / 2),
+      width: Math.round(boxWidth),
+      height: Math.round(boxHeight),
+      detected: false
+    };
+  }
+
+  function expandToA4Box(box, canvasWidth, canvasHeight) {
+    var portraitRatio = 1 / 1.414;
+    var landscapeRatio = 1.414;
+    var ratio = box.width / box.height;
+    var targetRatio = ratio > 1 ? landscapeRatio : portraitRatio;
+    var centerX = box.x + box.width / 2;
+    var centerY = box.y + box.height / 2;
+    var width = box.width;
+    var height = box.height;
+    if (width / height > targetRatio) height = width / targetRatio;
+    else width = height * targetRatio;
+    width *= 1.08;
+    height *= 1.08;
+    width = Math.min(width, canvasWidth);
+    height = Math.min(height, canvasHeight);
+    return {
+      x: Math.round(clamp(centerX - width / 2, 0, canvasWidth - width)),
+      y: Math.round(clamp(centerY - height / 2, 0, canvasHeight - height)),
+      width: Math.round(width),
+      height: Math.round(height),
+      detected: true
+    };
   }
 
   function captureToCanvas(source) {
@@ -126,42 +211,278 @@
     return canvas;
   }
 
+  function a4OutputSize(sourceCanvas) {
+    if (sourceCanvas.width > sourceCanvas.height) {
+      return { width: 1754, height: 1240 };
+    }
+    return { width: 1240, height: 1754 };
+  }
+
+  function polygonArea(points) {
+    var area = 0;
+    for (var i = 0; i < points.length; i += 1) {
+      var next = points[(i + 1) % points.length];
+      area += points[i].x * next.y - next.x * points[i].y;
+    }
+    return Math.abs(area / 2);
+  }
+
+  function orderCorners(points) {
+    var topLeft = points[0];
+    var topRight = points[0];
+    var bottomLeft = points[0];
+    var bottomRight = points[0];
+    points.forEach(function (point) {
+      var sum = point.x + point.y;
+      var diff = point.x - point.y;
+      if (sum < topLeft.x + topLeft.y) topLeft = point;
+      if (sum > bottomRight.x + bottomRight.y) bottomRight = point;
+      if (diff > topRight.x - topRight.y) topRight = point;
+      if (diff < bottomLeft.x - bottomLeft.y) bottomLeft = point;
+    });
+    return {
+      topLeftCorner: topLeft,
+      topRightCorner: topRight,
+      bottomLeftCorner: bottomLeft,
+      bottomRightCorner: bottomRight
+    };
+  }
+
+  function cornersToArray(corners) {
+    return [
+      corners.topLeftCorner,
+      corners.topRightCorner,
+      corners.bottomRightCorner,
+      corners.bottomLeftCorner
+    ];
+  }
+
+  function cornerScore(corners, canvasWidth, canvasHeight) {
+    var points = cornersToArray(corners);
+    var area = polygonArea(points);
+    var imageArea = canvasWidth * canvasHeight;
+    if (area < imageArea * .004 || area > imageArea * .94) return 0;
+    var top = Math.hypot(corners.topRightCorner.x - corners.topLeftCorner.x, corners.topRightCorner.y - corners.topLeftCorner.y);
+    var bottom = Math.hypot(corners.bottomRightCorner.x - corners.bottomLeftCorner.x, corners.bottomRightCorner.y - corners.bottomLeftCorner.y);
+    var left = Math.hypot(corners.bottomLeftCorner.x - corners.topLeftCorner.x, corners.bottomLeftCorner.y - corners.topLeftCorner.y);
+    var right = Math.hypot(corners.bottomRightCorner.x - corners.topRightCorner.x, corners.bottomRightCorner.y - corners.topRightCorner.y);
+    var width = (top + bottom) / 2;
+    var height = (left + right) / 2;
+    if (!width || !height) return 0;
+    var ratio = width / height;
+    var ratioErr = Math.min(Math.abs(ratio - .707), Math.abs(ratio - 1.414));
+    var ratioScore = Math.max(.15, 1 - ratioErr * 1.4);
+    var centerX = points.reduce(function (sum, point) { return sum + point.x; }, 0) / 4;
+    var centerY = points.reduce(function (sum, point) { return sum + point.y; }, 0) / 4;
+    var centerPenalty = Math.hypot(centerX - canvasWidth / 2, centerY - canvasHeight / 2) / Math.hypot(canvasWidth / 2, canvasHeight / 2);
+    return area * ratioScore * Math.max(.35, 1 - centerPenalty * .45);
+  }
+
+  function readApproxPoints(approx) {
+    var points = [];
+    for (var i = 0; i < approx.data32S.length; i += 2) {
+      points.push({ x: approx.data32S[i], y: approx.data32S[i + 1] });
+    }
+    return points;
+  }
+
+  function findDocumentCorners(sourceCanvas) {
+    if (!window.cv || !window.cv.Mat) return null;
+    var src = null;
+    var gray = null;
+    var blur = null;
+    var edges = null;
+    var kernel = null;
+    var contours = null;
+    var hierarchy = null;
+    var best = null;
+    var bestScore = 0;
+    try {
+      src = cv.imread(sourceCanvas);
+      gray = new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      blur = new cv.Mat();
+      cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+      edges = new cv.Mat();
+      cv.Canny(blur, edges, 35, 120);
+      kernel = cv.Mat.ones(5, 5, cv.CV_8U);
+      cv.dilate(edges, edges, kernel, new cv.Point(-1, -1), 2);
+      cv.morphologyEx(edges, edges, cv.MORPH_CLOSE, kernel);
+      contours = new cv.MatVector();
+      hierarchy = new cv.Mat();
+      cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      for (var i = 0; i < contours.size(); i += 1) {
+        var contour = contours.get(i);
+        var area = cv.contourArea(contour);
+        if (area < sourceCanvas.width * sourceCanvas.height * .004) {
+          contour.delete();
+          continue;
+        }
+        var peri = cv.arcLength(contour, true);
+        var foundQuad = [.018, .026, .035, .052, .075].some(function (epsilon) {
+          var approx = new cv.Mat();
+          cv.approxPolyDP(contour, approx, peri * epsilon, true);
+          if (approx.rows === 4) {
+            var corners = orderCorners(readApproxPoints(approx));
+            var score = cornerScore(corners, sourceCanvas.width, sourceCanvas.height);
+            if (score > bestScore) {
+              bestScore = score;
+              best = corners;
+            }
+            approx.delete();
+            return true;
+          }
+          approx.delete();
+          return false;
+        });
+        if (!foundQuad) {
+          try {
+            var rect = cv.minAreaRect(contour);
+            var rectPoints = cv.RotatedRect.points(rect).map(function (point) {
+              return { x: point.x, y: point.y };
+            });
+            var rectCorners = orderCorners(rectPoints);
+            var rectScore = cornerScore(rectCorners, sourceCanvas.width, sourceCanvas.height) * .72;
+            if (rectScore > bestScore) {
+              bestScore = rectScore;
+              best = rectCorners;
+            }
+          } catch (e) {}
+        }
+        contour.delete();
+      }
+    } catch (e) {
+      best = null;
+    } finally {
+      if (src) src.delete();
+      if (gray) gray.delete();
+      if (blur) blur.delete();
+      if (edges) edges.delete();
+      if (kernel) kernel.delete();
+      if (contours) contours.delete();
+      if (hierarchy) hierarchy.delete();
+    }
+    return bestScore > sourceCanvas.width * sourceCanvas.height * .006 ? best : null;
+  }
+
+  function scaleCorners(corners, scaleX, scaleY) {
+    if (!corners) return null;
+    return {
+      topLeftCorner: { x: corners.topLeftCorner.x * scaleX, y: corners.topLeftCorner.y * scaleY },
+      topRightCorner: { x: corners.topRightCorner.x * scaleX, y: corners.topRightCorner.y * scaleY },
+      bottomLeftCorner: { x: corners.bottomLeftCorner.x * scaleX, y: corners.bottomLeftCorner.y * scaleY },
+      bottomRightCorner: { x: corners.bottomRightCorner.x * scaleX, y: corners.bottomRightCorner.y * scaleY }
+    };
+  }
+
+  async function extractWithScanner(sourceCanvas) {
+    if (!(await prepareScanner())) return null;
+    try {
+      var size = a4OutputSize(sourceCanvas);
+      var corners = findDocumentCorners(sourceCanvas);
+      var result = corners ?
+        state.scanner.extractPaper(sourceCanvas, size.width, size.height, corners) :
+        state.scanner.extractPaper(sourceCanvas, size.width, size.height);
+      if (!result || !result.width || !result.height) return null;
+      return result;
+    } catch (e) {
+      return null;
+    }
+  }
+
   function detectDocumentBox(canvas) {
     var ctx = canvas.getContext("2d", { willReadFrequently: true });
-    var step = Math.max(4, Math.round(Math.min(canvas.width, canvas.height) / 180));
+    var step = Math.max(3, Math.round(Math.min(canvas.width, canvas.height) / 220));
     var data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    var border = [];
+    var center = [];
+    var borderSize = Math.max(step * 4, Math.round(Math.min(canvas.width, canvas.height) * .06));
+    var centerLeft = canvas.width * .34;
+    var centerRight = canvas.width * .66;
+    var centerTop = canvas.height * .34;
+    var centerBottom = canvas.height * .66;
+    for (var sampleY = 0; sampleY < canvas.height; sampleY += step * 2) {
+      for (var sampleX = 0; sampleX < canvas.width; sampleX += step * 2) {
+        var sampleI = (sampleY * canvas.width + sampleX) * 4;
+        var sampleLuma = data[sampleI] * .299 + data[sampleI + 1] * .587 + data[sampleI + 2] * .114;
+        if (sampleX < borderSize || sampleY < borderSize || sampleX > canvas.width - borderSize || sampleY > canvas.height - borderSize) {
+          border.push(sampleLuma);
+        }
+        if (sampleX > centerLeft && sampleX < centerRight && sampleY > centerTop && sampleY < centerBottom) {
+          center.push(sampleLuma);
+        }
+      }
+    }
+    var bgLuma = median(border);
+    var centerLuma = median(center);
     var minX = canvas.width;
     var minY = canvas.height;
     var maxX = 0;
     var maxY = 0;
     var count = 0;
+    var edgeMinX = canvas.width;
+    var edgeMinY = canvas.height;
+    var edgeMaxX = 0;
+    var edgeMaxY = 0;
+    var edgeCount = 0;
+    var usefulLeft = canvas.width * .04;
+    var usefulRight = canvas.width * .96;
+    var usefulTop = canvas.height * .04;
+    var usefulBottom = canvas.height * .96;
     for (var y = 0; y < canvas.height; y += step) {
       for (var x = 0; x < canvas.width; x += step) {
         var i = (y * canvas.width + x) * 4;
         var r = data[i];
         var g = data[i + 1];
         var b = data[i + 2];
-        var brightness = (r + g + b) / 3;
+        var brightness = r * .299 + g * .587 + b * .114;
         var spread = Math.max(r, g, b) - Math.min(r, g, b);
-        if (brightness > 118 && spread < 82) {
+        var paperLike = spread < 92 && (
+          brightness > Math.max(112, bgLuma + 14) ||
+          brightness > Math.max(128, centerLuma - 30) ||
+          (brightness > 150 && Math.abs(brightness - centerLuma) < 58)
+        );
+        if (paperLike && x > usefulLeft && x < usefulRight && y > usefulTop && y < usefulBottom) {
           minX = Math.min(minX, x);
           minY = Math.min(minY, y);
           maxX = Math.max(maxX, x);
           maxY = Math.max(maxY, y);
           count += 1;
         }
+        if (x >= step && y >= step) {
+          var leftI = (y * canvas.width + x - step) * 4;
+          var topI = ((y - step) * canvas.width + x) * 4;
+          var leftLuma = data[leftI] * .299 + data[leftI + 1] * .587 + data[leftI + 2] * .114;
+          var topLuma = data[topI] * .299 + data[topI + 1] * .587 + data[topI + 2] * .114;
+          var edge = Math.abs(brightness - leftLuma) + Math.abs(brightness - topLuma);
+          if (edge > 48 && x > usefulLeft && x < usefulRight && y > usefulTop && y < usefulBottom) {
+            edgeMinX = Math.min(edgeMinX, x);
+            edgeMinY = Math.min(edgeMinY, y);
+            edgeMaxX = Math.max(edgeMaxX, x);
+            edgeMaxY = Math.max(edgeMaxY, y);
+            edgeCount += 1;
+          }
+        }
       }
     }
     var area = (maxX - minX) * (maxY - minY);
-    if (count < 50 || area < canvas.width * canvas.height * .12) {
-      return { x: 0, y: 0, width: canvas.width, height: canvas.height, detected: false };
+    var edgeArea = (edgeMaxX - edgeMinX) * (edgeMaxY - edgeMinY);
+    if ((count < 45 || area < canvas.width * canvas.height * .10) && edgeCount > 70 && edgeArea > canvas.width * canvas.height * .16) {
+      minX = edgeMinX;
+      minY = edgeMinY;
+      maxX = edgeMaxX;
+      maxY = edgeMaxY;
+      area = edgeArea;
+    }
+    if (area < canvas.width * canvas.height * .10) {
+      return a4CenterBox(canvas.width, canvas.height);
     }
     var pad = Math.round(Math.min(canvas.width, canvas.height) * .018);
     minX = Math.max(0, minX - pad);
     minY = Math.max(0, minY - pad);
     maxX = Math.min(canvas.width, maxX + pad);
     maxY = Math.min(canvas.height, maxY + pad);
-    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY, detected: true };
+    return expandToA4Box({ x: minX, y: minY, width: maxX - minX, height: maxY - minY }, canvas.width, canvas.height);
   }
 
   function applyScanLook(canvas, mode) {
@@ -190,19 +511,28 @@
   }
 
   async function processCanvas(sourceCanvas) {
-    var box = detectDocumentBox(sourceCanvas);
     var crop = $("#cropCanvas");
     var ctx = crop.getContext("2d", { willReadFrequently: true });
-    crop.width = box.width;
-    crop.height = box.height;
-    ctx.drawImage(sourceCanvas, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
+    var scannerCanvas = await extractWithScanner(sourceCanvas);
+    var detected = !!scannerCanvas;
+    if (scannerCanvas) {
+      crop.width = scannerCanvas.width;
+      crop.height = scannerCanvas.height;
+      ctx.drawImage(scannerCanvas, 0, 0);
+    } else {
+      var box = detectDocumentBox(sourceCanvas);
+      crop.width = box.width;
+      crop.height = box.height;
+      ctx.drawImage(sourceCanvas, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
+      detected = box.detected;
+    }
     applyScanLook(crop, state.mode);
     var blob = await canvasToBlob(crop, "image/jpeg", .88);
     return {
       id: uid(),
       dataUrl: await blobToDataUrl(blob),
       rotation: 0,
-      detected: box.detected
+      detected: detected
     };
   }
 
@@ -262,14 +592,44 @@
           temp.width = 360;
           temp.height = Math.max(240, Math.round(360 * video.videoHeight / video.videoWidth));
           temp.getContext("2d").drawImage(video, 0, 0, temp.width, temp.height);
-          state.lastBox = detectDocumentBox(temp);
+          var corners = state.scannerReady ? findDocumentCorners(temp) : null;
+          state.lastShape = corners;
+          state.lastBox = corners ? null : detectDocumentBox(temp);
         } catch (e) {
+          state.lastShape = null;
           state.lastBox = null;
         }
         state.detecting = false;
       }, 260);
     }
-    if (state.lastBox && state.lastBox.detected) {
+    if (state.lastShape) {
+      var tempHeight = Math.max(240, Math.round(360 * video.videoHeight / video.videoWidth));
+      var scaledCorners = scaleCorners(state.lastShape, canvas.width / 360, canvas.height / tempHeight);
+      var points = cornersToArray(scaledCorners);
+      ctx.save();
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.beginPath();
+      points.forEach(function (point, index) {
+        if (index === 0) ctx.moveTo(point.x, point.y);
+        else ctx.lineTo(point.x, point.y);
+      });
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      ctx.strokeStyle = "#dfe9b9";
+      ctx.lineWidth = 4;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      points.forEach(function (point, index) {
+        if (index === 0) ctx.moveTo(point.x, point.y);
+        else ctx.lineTo(point.x, point.y);
+      });
+      ctx.closePath();
+      ctx.stroke();
+      if (!$("#capturePage").hidden) requestAnimationFrame(drawGuide);
+      return;
+    }
+    if (state.lastBox) {
       box = {
         x: state.lastBox.x / 360 * canvas.width,
         y: state.lastBox.y / Math.max(240, Math.round(360 * video.videoHeight / video.videoWidth)) * canvas.height,
@@ -300,7 +660,11 @@
 
   function updateStatus() {
     var count = state.pages.length;
-    $("#docStatus").textContent = count ? count + " стор. у документі" : "Локальний сканер";
+    var status = "Локальний сканер";
+    if (state.scannerStatus === "ready") status = "OpenCV готовий";
+    if (state.scannerStatus === "fallback") status = "A4 fallback";
+    $("#docStatus").textContent = count ? count + " стор. у документі" : status;
+    document.documentElement.dataset.scanner = state.scannerStatus;
   }
 
   function render() {
@@ -634,6 +998,11 @@
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("sw.js").catch(function () {});
     }
+    prepareScanner().then(function (ready) {
+      state.scannerStatus = ready ? "ready" : "fallback";
+      updateStatus();
+      if (ready) toast("OpenCV сканер готовий.");
+    });
     await openDb();
     await loadDocument();
     render();

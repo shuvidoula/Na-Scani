@@ -1,9 +1,13 @@
-const CACHE_NAME = "na-scani-v0.1.1";
+const CACHE_NAME = "na-scani-v0.2.4";
 const FILES = [
   "./",
   "./index.html",
   "./manifest.webmanifest",
   "./icon.svg",
+  "./vendor/jscanify/LICENSE",
+  "./vendor/jscanify/opencv.js",
+  "./vendor/jscanify/jscanify.js",
+  "./src/js/boot-errors.js",
   "./src/css/app.css",
   "./src/js/app.js"
 ];
@@ -26,6 +30,18 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
+  if (event.request.mode === "navigate") {
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put("./index.html", copy));
+          return response;
+        })
+        .catch(() => caches.match("./index.html"))
+    );
+    return;
+  }
   event.respondWith(
     caches.match(event.request).then((cached) => {
       if (cached) return cached;
